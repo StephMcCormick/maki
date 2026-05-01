@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -29,6 +29,7 @@ struct JobMeta {
     on_stderr: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     event_rx: Option<flume::Receiver<JobEvent>>,
+    stdin_tx: Option<flume::Sender<String>>,
 }
 
 pub(crate) struct JobStore {
@@ -44,20 +45,25 @@ impl JobStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &mut self,
         cmd: &str,
         cwd: Option<String>,
         env: Option<HashMap<String, String>>,
+        use_stdin: bool,
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
         let mut command = shell_command(cmd);
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        if use_stdin {
+            command.stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
+        }
 
         #[cfg(unix)]
         {
@@ -115,6 +121,25 @@ impl JobStore {
         let stdout_handle = spawn_reader!(stdout, "job-stdout", Stdout);
         let stderr_handle = spawn_reader!(stderr, "job-stderr", Stderr);
 
+        let stdin_tx = if use_stdin {
+            let (tx, rx) = flume::bounded::<String>(64);
+            let mut stdin = child.stdin.take().expect("stdin should be piped");
+            thread::Builder::new()
+                .name("job-stdin".into())
+                .spawn(move || {
+                    for data in rx.iter() {
+                        if stdin.write_all(data.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                    drop(stdin);
+                })
+                .map_err(|e| e.to_string())?;
+            Some(tx)
+        } else {
+            None
+        };
+
         thread::Builder::new()
             .name("job-wait".into())
             .spawn(move || {
@@ -138,6 +163,7 @@ impl JobStore {
                 on_stderr,
                 on_exit,
                 event_rx: Some(event_rx),
+                stdin_tx,
             },
         );
 
@@ -171,6 +197,7 @@ impl JobStore {
                 on_stderr: None,
                 on_exit,
                 event_rx: Some(event_rx),
+                stdin_tx: None,
             },
         );
 
@@ -213,6 +240,21 @@ impl JobStore {
     pub fn mark_dead(&mut self, job_id: u32) {
         if let Some(meta) = self.jobs.get_mut(&job_id) {
             meta.alive = false;
+        }
+    }
+
+    pub fn write(&self, job_id: u32, data: String) -> Result<(), String> {
+        self.jobs
+            .get(&job_id)
+            .and_then(|m| m.stdin_tx.as_ref())
+            .ok_or_else(|| "job does not accept stdin".to_string())?
+            .send(data)
+            .map_err(|_| "job stdin closed".to_string())
+    }
+
+    pub fn close_stdin(&mut self, job_id: u32) {
+        if let Some(meta) = self.jobs.get_mut(&job_id) {
+            meta.stdin_tx.take();
         }
     }
 
@@ -265,6 +307,7 @@ fn kill_job(meta: &mut JobMeta) {
             meta.alive = false;
         }
         JobKind::Process { pid } => {
+            meta.stdin_tx.take();
             #[cfg(unix)]
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
@@ -295,13 +338,14 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
     t.set(
         "jobstart",
         lua.create_function(|lua, (cmd, opts): (String, Option<Table>)| {
-            let (cwd, env, on_stdout, on_stderr, on_exit) = match opts {
+            let (cwd, env, use_stdin, on_stdout, on_stderr, on_exit) = match opts {
                 Some(ref opts) => {
                     let cwd: Option<String> = opts.get("cwd").ok();
                     let env: Option<HashMap<String, String>> = opts
                         .get::<Table>("env")
                         .ok()
                         .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
+                    let use_stdin: bool = opts.get("stdin").unwrap_or(false);
                     let on_stdout = opts
                         .get::<Function>("on_stdout")
                         .ok()
@@ -317,13 +361,13 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
                         .ok()
                         .map(|f| lua.create_registry_value(f))
                         .transpose()?;
-                    (cwd, env, on_stdout, on_stderr, on_exit)
+                    (cwd, env, use_stdin, on_stdout, on_stderr, on_exit)
                 }
-                None => (None, None, None, None, None),
+                None => (None, None, false, None, None, None),
             };
 
             with_task_jobs(lua, |store| {
-                store.start(&cmd, cwd, env, on_stdout, on_stderr, on_exit)
+                store.start(&cmd, cwd, env, use_stdin, on_stdout, on_stderr, on_exit)
             })
             .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
             .map_err(mlua::Error::runtime)
@@ -334,6 +378,24 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
         "jobstop",
         lua.create_function(|lua, job_id: u32| {
             with_task_jobs(lua, |store| store.kill(job_id))
+                .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?;
+            Ok(())
+        })?,
+    )?;
+
+    t.set(
+        "jobwrite",
+        lua.create_function(|lua, (job_id, data): (u32, String)| {
+            with_task_jobs(lua, |store| store.write(job_id, data))
+                .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
+                .map_err(mlua::Error::runtime)
+        })?,
+    )?;
+
+    t.set(
+        "jobclose",
+        lua.create_function(|lua, job_id: u32| {
+            with_task_jobs(lua, |store| store.close_stdin(job_id))
                 .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?;
             Ok(())
         })?,
@@ -391,7 +453,7 @@ mod tests {
 
     fn start_echo(store: &mut JobStore) -> u32 {
         store
-            .start("echo hello", None, None, None, None, None)
+            .start("echo hello", None, None, false, None, None, None)
             .unwrap()
     }
 
@@ -402,6 +464,7 @@ mod tests {
             "echo hello",
             Some("/nonexistent_dir_abc_xyz_123".into()),
             None,
+            false,
             None,
             None,
             None,
@@ -541,5 +604,65 @@ mod tests {
 
         store.kill(id);
         assert!(!store.has_alive_jobs());
+    }
+
+    #[test]
+    fn write_to_job_without_stdin_returns_error() {
+        let mut store = make_store();
+        let id = start_echo(&mut store);
+        assert_eq!(
+            store.write(id, "hello".into()),
+            Err("job does not accept stdin".to_string())
+        );
+    }
+
+    #[test]
+    fn write_to_nonexistent_job_returns_error() {
+        let store = make_store();
+        assert_eq!(
+            store.write(999, "hello".into()),
+            Err("job does not accept stdin".to_string())
+        );
+    }
+
+    #[test]
+    fn write_to_job_with_stdin_delivers_data() {
+        let mut store = make_store();
+        let id = store
+            .start("cat", None, None, true, None, None, None)
+            .unwrap();
+
+        store.write(id, "hello stdin\n".into()).unwrap();
+        store.close_stdin(id);
+
+        let rx = store.take_receiver(id).unwrap();
+        let mut got_output = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(JobEvent::Stdout(line)) if line == "hello stdin" => {
+                    got_output = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(flume::RecvTimeoutError::Timeout) => continue,
+                Err(flume::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(got_output, "cat should echo stdin to stdout");
+    }
+
+    #[test]
+    fn write_after_kill_returns_error() {
+        let mut store = make_store();
+        let id = store
+            .start("sleep 10", None, None, true, None, None, None)
+            .unwrap();
+
+        store.write(id, "before".into()).unwrap();
+        store.kill(id);
+
+        let result = store.write(id, "after".into());
+        assert!(result.is_err());
     }
 }
