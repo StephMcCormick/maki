@@ -4,6 +4,13 @@ pub(crate) fn create_env_table(lua: &Lua) -> LuaResult<Table> {
     let t = lua.create_table()?;
 
     t.set(
+        "getenv",
+        lua.create_function(|_, key: String| {
+            Ok(std::env::var(&key).ok())
+        })?,
+    )?;
+
+    t.set(
         "state_dir",
         lua.create_function(|_, ()| {
             Ok(maki_storage::paths::state_dir()

@@ -10,6 +10,8 @@ use test_case::test_case;
 #[test_case("skill", include_str!("../../plugins/skill/tests/spec.lua") ; "skill_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]
+#[test_case("rust_analyzer", include_str!("../../../maki-agent/plugins/rust-analyzer/tests/spec.lua") ; "rust_analyzer_spec")]
+#[test_case("rust_analyzer_integration", include_str!("../../../maki-agent/plugins/rust-analyzer/tests/integration_spec.lua") ; "rust_analyzer_integration_spec")]
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();

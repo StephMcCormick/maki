@@ -157,11 +157,16 @@ type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
 type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
 
+type GlobalJobStore = JobStore;
+
 pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
     let key = ThreadKey::current(lua);
-    let mut tasks = lua.app_data_mut::<TaskMap>()?;
-    let ctx = tasks.get_mut(&key)?;
-    Some(f(&mut ctx.jobs))
+    if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
+        if let Some(ctx) = tasks.get_mut(&key) {
+            return Some(f(&mut ctx.jobs));
+        }
+    }
+    lua.app_data_mut::<GlobalJobStore>().map(|mut store| f(&mut store))
 }
 
 pub(crate) fn with_task_bufs<R>(lua: &Lua, f: impl FnOnce(&mut BufferStore) -> R) -> Option<R> {
@@ -477,6 +482,7 @@ impl LuaRuntime {
         })?;
 
         lua.set_app_data(TaskMap::new());
+        lua.set_app_data(JobStore::new());
         lua.set_app_data(ClickHandlerMap::new());
         lua.set_app_data(CommandHandlerMap::new());
         lua.set_app_data(SpawnQueue::default());
