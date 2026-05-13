@@ -237,6 +237,58 @@ impl PluginHost {
         self.send_load(Arc::from("user"), source, plugin_dir)
     }
 
+    pub fn load_user_plugins(&self) -> Result<(), PluginError> {
+        let plugins_dir = maki_config::global_config_dir()
+            .map(|d| d.join("plugins"))
+            .filter(|d| d.is_dir());
+
+        let Some(ref plugins_dir) = plugins_dir else {
+            return Ok(());
+        };
+
+        let entries = fs::read_dir(plugins_dir).map_err(|e| PluginError::Io {
+            path: plugins_dir.clone(),
+            source: e,
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| PluginError::Io {
+                path: plugins_dir.clone(),
+                source: e,
+            })?;
+            let plugin_dir = entry.path();
+            if !plugin_dir.is_dir() {
+                continue;
+            }
+
+            let init_path = plugin_dir.join("init.lua");
+            if !init_path.is_file() {
+                continue;
+            }
+
+            let name = plugin_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .ok_or_else(|| PluginError::Io {
+                    path: plugin_dir.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "plugin directory has no name",
+                    ),
+                })?;
+
+            let source = fs::read_to_string(&init_path).map_err(|e| PluginError::Io {
+                path: init_path.clone(),
+                source: e,
+            })?;
+
+            tracing::info!(plugin = %name, "loading user plugin");
+            self.send_load(Arc::from(name), source, Some(plugin_dir))?;
+        }
+
+        Ok(())
+    }
+
     pub fn event_handle(&self) -> Option<EventHandle> {
         self.inner
             .as_ref()
