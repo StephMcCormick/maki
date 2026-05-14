@@ -123,10 +123,11 @@ pub struct LiveCtx {
     pub tool_use_id: String,
 }
 
-struct TaskCtx {
+pub(crate) struct TaskCtx {
     cancel: CancelToken,
     deadline: Option<Instant>,
-    jobs: JobStore,
+    pub(crate) owned_jobs: Vec<u32>,
+    pub(crate) has_jobs: bool,
     bufs: BufferStore,
     live: Option<LiveCtx>,
 }
@@ -136,7 +137,8 @@ impl TaskCtx {
         Self {
             cancel,
             deadline,
-            jobs: JobStore::new(),
+            owned_jobs: Vec::new(),
+            has_jobs: false,
             bufs: BufferStore::new(),
             live,
         }
@@ -144,16 +146,16 @@ impl TaskCtx {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ThreadKey(usize);
+pub(crate) struct ThreadKey(usize);
 
 impl ThreadKey {
-    fn current(lua: &Lua) -> Self {
+    pub(crate) fn current(lua: &Lua) -> Self {
         Self(lua.current_thread().to_pointer() as usize)
     }
 }
 
-/// Keyed by coroutine pointer. Single-threaded, so no locking needed.
-type TaskMap = HashMap<ThreadKey, TaskCtx>;
+/// Single-threaded: keyed by coroutine pointer, no locking needed.
+pub(crate) type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
 type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
 
@@ -165,24 +167,6 @@ type ActiveTaskKey = Cell<Option<ThreadKey>>;
 type GlobalJobStore = JobStore;
 
 pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
-    // Check active task key first (set by dispatch_async for callbacks
-    // running in a different coroutine than the one that started the job).
-    if let Some(active) = lua.app_data_ref::<ActiveTaskKey>() {
-        if let Some(key) = active.get() {
-            if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-                if let Some(ctx) = tasks.get_mut(&key) {
-                    return Some(f(&mut ctx.jobs));
-                }
-            }
-        }
-    }
-    // Fall back to current coroutine's task.
-    let key = ThreadKey::current(lua);
-    if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-        if let Some(ctx) = tasks.get_mut(&key) {
-            return Some(f(&mut ctx.jobs));
-        }
-    }
     lua.app_data_mut::<GlobalJobStore>().map(|mut store| f(&mut store))
 }
 
@@ -248,8 +232,12 @@ impl Drop for TaskCleanupGuard {
             .app_data_mut::<TaskMap>()
             .and_then(|mut m| m.remove(&self.key))
         {
-            task.jobs.kill_all();
-            task.jobs.clear(&self.lua);
+            // Kill only owned (non-global) jobs in the global store.
+            if let Some(mut store) = self.lua.app_data_mut::<GlobalJobStore>() {
+                for job_id in task.owned_jobs {
+                    store.kill(job_id);
+                }
+            }
             task.bufs.clear();
         }
         // Restore the previous active task key.
@@ -263,8 +251,6 @@ fn register_task(lua: &Lua, thread_key: ThreadKey, ctx: TaskCtx) -> TaskCleanupG
     if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
         tasks.insert(thread_key, ctx);
     }
-    // Set active task key so FFI functions can find the right job store
-    // even when called from callbacks running in a different coroutine.
     let old_active = lua
         .app_data_ref::<ActiveTaskKey>()
         .and_then(|a| a.get());
@@ -1098,7 +1084,11 @@ async fn dispatch_async(
 ) -> ToolCallReply {
     let task_state = lua.app_data_ref::<TaskMap>().and_then(|m| {
         let ctx = m.get(&key)?;
-        Some((ctx.cancel.clone(), ctx.deadline, !ctx.jobs.is_empty()))
+        let has_owned = ctx.has_jobs;
+        let has_global = lua.app_data_ref::<GlobalJobStore>()
+            .map(|s| s.has_alive_jobs())
+            .unwrap_or(false);
+        Some((ctx.cancel.clone(), ctx.deadline, has_owned || has_global))
     });
 
     let Some((cancel, deadline, has_jobs)) = task_state else {
@@ -1130,16 +1120,16 @@ async fn dispatch_async(
             Err(flume::TryRecvError::Empty) => {}
         }
 
-        if let Some(m) = lua.app_data_ref::<TaskMap>() {
-            if let Some(ctx) = m.get(&key) {
-                ctx.jobs.drain_events(&mut event_buf);
+        if let Some(_m) = lua.app_data_ref::<TaskMap>() {
+            if let Some(store) = lua.app_data_mut::<GlobalJobStore>() {
+                store.drain_events(&mut event_buf);
             }
         }
 
         if event_buf.is_empty() {
             let has_alive = lua
-                .app_data_ref::<TaskMap>()
-                .and_then(|m| Some(m.get(&key)?.jobs.has_alive_jobs()))
+                .app_data_ref::<GlobalJobStore>()
+                .map(|s| s.has_alive_jobs())
                 .unwrap_or(false);
 
             if !has_alive {
@@ -1156,10 +1146,8 @@ async fn dispatch_async(
         for (job_id, event) in event_buf.drain(..) {
             let is_exit = matches!(event, JobEvent::Exit(_));
 
-            let callback = lua.app_data_ref::<TaskMap>().and_then(|m| {
-                let ctx = m.get(&key)?;
-                ctx.jobs
-                    .callback_key(job_id, &event)
+            let callback = lua.app_data_ref::<GlobalJobStore>().and_then(|s| {
+                s.callback_key(job_id, &event)
                     .and_then(|k| lua.registry_value::<Function>(k).ok())
             });
 
@@ -1193,10 +1181,8 @@ async fn dispatch_async(
             }
 
             if is_exit {
-                if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
-                    if let Some(ctx) = tasks.get_mut(&key) {
-                        ctx.jobs.mark_dead(job_id);
-                    }
+                if let Some(mut store) = lua.app_data_mut::<GlobalJobStore>() {
+                    store.mark_dead(job_id);
                 }
             }
         }

@@ -251,6 +251,7 @@ impl JobStore {
         self.jobs.values().any(|j| j.alive)
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.jobs.is_empty()
     }
@@ -289,12 +290,13 @@ impl JobStore {
     }
 
     pub fn write(&self, job_id: u32, data: String) -> Result<(), String> {
-        self.jobs
-            .get(&job_id)
-            .and_then(|m| m.stdin_tx.as_ref())
-            .ok_or_else(|| "job does not accept stdin".to_string())?
-            .send(data)
-            .map_err(|_| "job stdin closed".to_string())
+        let meta = self.jobs.get(&job_id).ok_or_else(|| {
+            format!("job {} not found", job_id)
+        })?;
+        let tx = meta.stdin_tx.as_ref().ok_or_else(|| {
+            format!("job {} does not accept stdin", job_id)
+        })?;
+        tx.send(data).map_err(|_| "job stdin closed".to_string())
     }
 
     pub fn close_stdin(&mut self, job_id: u32) {
@@ -311,6 +313,7 @@ impl JobStore {
         }
     }
 
+    #[allow(dead_code)]
     pub fn kill_all(&mut self) {
         for meta in self.jobs.values_mut() {
             if meta.alive {
@@ -319,6 +322,7 @@ impl JobStore {
         }
     }
 
+    #[allow(dead_code)]
     pub fn clear(&mut self, lua: &Lua) {
         for (_, meta) in self.jobs.drain() {
             for key in [
@@ -389,7 +393,7 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
     t.set(
         "jobstart",
         lua.create_function(|lua, (cmd, opts): (String, Option<Table>)| {
-            let (cwd, env, use_stdin, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit) =
+            let (cwd, env, use_stdin, is_global, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit) =
                 match opts {
                     Some(ref opts) => {
                         let cwd: Option<String> = opts.get("cwd").ok();
@@ -398,6 +402,7 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
                             .ok()
                             .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
                         let use_stdin: bool = opts.get("stdin").unwrap_or(false);
+                        let is_global: bool = opts.get("global").unwrap_or(false);
                         let on_stdout = opts
                             .get::<Function>("on_stdout")
                             .ok()
@@ -423,16 +428,35 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
                             .ok()
                             .map(|f| lua.create_registry_value(f))
                             .transpose()?;
-                        (cwd, env, use_stdin, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit)
+                        (cwd, env, use_stdin, is_global, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit)
                     }
-                    None => (None, None, false, None, None, None, None, None),
+                    None => (None, None, false, false, None, None, None, None, None),
                 };
 
-            with_task_jobs(lua, |store| {
+            let job_id = with_task_jobs(lua, |store| {
                 store.start(&cmd, cwd, env, use_stdin, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit)
             })
             .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
-            .map_err(mlua::Error::runtime)
+            .map_err(mlua::Error::runtime)?;
+
+            // Track non-global jobs for task-level cleanup.
+            if !is_global {
+                if let Some(mut tasks) = lua.app_data_mut::<crate::runtime::TaskMap>() {
+                    let key = crate::runtime::ThreadKey::current(lua);
+                    if let Some(ctx) = tasks.get_mut(&key) {
+                        ctx.owned_jobs.push(job_id);
+                    }
+                }
+            }
+            // Mark task as having jobs (for dispatch_async).
+            if let Some(mut tasks) = lua.app_data_mut::<crate::runtime::TaskMap>() {
+                let key = crate::runtime::ThreadKey::current(lua);
+                if let Some(ctx) = tasks.get_mut(&key) {
+                    ctx.has_jobs = true;
+                }
+            }
+
+            Ok(job_id)
         })?,
     )?;
 
@@ -674,19 +698,15 @@ mod tests {
     fn write_to_job_without_stdin_returns_error() {
         let mut store = make_store();
         let id = start_echo(&mut store);
-        assert_eq!(
-            store.write(id, "hello".into()),
-            Err("job does not accept stdin".to_string())
-        );
+        let err = store.write(id, "hello".into()).unwrap_err();
+        assert!(err.contains("does not accept stdin"), "{err}");
     }
 
     #[test]
     fn write_to_nonexistent_job_returns_error() {
         let store = make_store();
-        assert_eq!(
-            store.write(999, "hello".into()),
-            Err("job does not accept stdin".to_string())
-        );
+        let err = store.write(999, "hello".into()).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
     }
 
     #[test]
