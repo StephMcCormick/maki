@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -14,6 +14,8 @@ const READER_BUF_SIZE: usize = 8 * 1024;
 pub(crate) enum JobEvent {
     Stdout(String),
     Stderr(String),
+    StdoutChunk(String),
+    StderrChunk(String),
     Exit(i32),
 }
 
@@ -27,6 +29,8 @@ struct JobMeta {
     alive: bool,
     on_stdout: Option<RegistryKey>,
     on_stderr: Option<RegistryKey>,
+    on_stdout_chunk: Option<RegistryKey>,
+    on_stderr_chunk: Option<RegistryKey>,
     on_exit: Option<RegistryKey>,
     event_rx: Option<flume::Receiver<JobEvent>>,
     stdin_tx: Option<flume::Sender<String>>,
@@ -54,6 +58,8 @@ impl JobStore {
         use_stdin: bool,
         on_stdout: Option<RegistryKey>,
         on_stderr: Option<RegistryKey>,
+        on_stdout_chunk: Option<RegistryKey>,
+        on_stderr_chunk: Option<RegistryKey>,
         on_exit: Option<RegistryKey>,
     ) -> Result<u32, String> {
         let mut command = shell_command(cmd);
@@ -94,21 +100,54 @@ impl JobStore {
         let stderr = child.stderr.take();
         let (event_tx, event_rx) = flume::unbounded();
 
-        macro_rules! spawn_reader {
-            ($stream:expr, $name:expr, $variant:ident) => {
-                if let Some(stream) = $stream {
+        // Single reader per stream: reads raw chunks, delivers both line and chunk events.
+        // This avoids competing readers on the same pipe.
+        macro_rules! spawn_combined_reader {
+            ($stream:expr, $name:expr, $line_variant:ident, $chunk_variant:ident) => {
+                if let Some(mut stream) = $stream {
                     let tx = event_tx.clone();
                     Some(
                         thread::Builder::new()
                             .name($name.into())
                             .spawn(move || {
-                                for line in BufReader::with_capacity(READER_BUF_SIZE, stream)
-                                    .lines()
-                                    .map_while(Result::ok)
-                                {
-                                    if tx.send(JobEvent::$variant(line)).is_err() {
+                                let mut buf = [0u8; READER_BUF_SIZE];
+                                let mut partial = String::new();
+                                loop {
+                                    let n = std::io::Read::read(&mut stream, &mut buf).unwrap_or(0);
+                                    if n == 0 {
                                         break;
                                     }
+                                    let chunk = buf[..n].to_vec();
+
+                                    // Deliver chunk event if callback exists
+                                    if let Ok(chunk_str) = String::from_utf8(chunk.clone()) {
+                                        if tx.send(JobEvent::$chunk_variant(chunk_str.clone())).is_err() {
+                                            break;
+                                        }
+
+                                        // Deliver line events: split chunk by \n
+                                        // \r may be present (preserved by BufReader::lines semantics)
+                                        let mut pos = 0;
+                                        for (i, b) in chunk_str.bytes().enumerate() {
+                                            if b == b'\n' {
+                                                let line = &chunk_str[pos..i];
+                                                // Strip trailing \r (matching BufReader::lines behavior)
+                                                let line = line.strip_suffix('\r').unwrap_or(line).to_string();
+                                                if tx.send(JobEvent::$line_variant(line)).is_err() {
+                                                    return;
+                                                }
+                                                pos = i + 1;
+                                            }
+                                        }
+                                        // Accumulate partial line for next chunk
+                                        partial = chunk_str[pos..].to_string();
+                                    }
+                                }
+
+                                // Flush remaining partial line
+                                if !partial.is_empty() {
+                                    let line = partial.strip_suffix('\r').unwrap_or(&partial).to_string();
+                                    let _ = tx.send(JobEvent::$line_variant(line));
                                 }
                             })
                             .map_err(|e| e.to_string())?,
@@ -118,8 +157,8 @@ impl JobStore {
                 }
             };
         }
-        let stdout_handle = spawn_reader!(stdout, "job-stdout", Stdout);
-        let stderr_handle = spawn_reader!(stderr, "job-stderr", Stderr);
+        let stdout_handle = spawn_combined_reader!(stdout, "job-stdout", Stdout, StdoutChunk);
+        let stderr_handle = spawn_combined_reader!(stderr, "job-stderr", Stderr, StderrChunk);
 
         let stdin_tx = if use_stdin {
             let (tx, rx) = flume::bounded::<String>(64);
@@ -161,6 +200,8 @@ impl JobStore {
                 alive: true,
                 on_stdout,
                 on_stderr,
+                on_stdout_chunk,
+                on_stderr_chunk,
                 on_exit,
                 event_rx: Some(event_rx),
                 stdin_tx,
@@ -195,6 +236,8 @@ impl JobStore {
                 alive: true,
                 on_stdout: None,
                 on_stderr: None,
+                on_stdout_chunk: None,
+                on_stderr_chunk: None,
                 on_exit,
                 event_rx: Some(event_rx),
                 stdin_tx: None,
@@ -217,6 +260,8 @@ impl JobStore {
         match event {
             JobEvent::Stdout(_) => meta.on_stdout.as_ref(),
             JobEvent::Stderr(_) => meta.on_stderr.as_ref(),
+            JobEvent::StdoutChunk(_) => meta.on_stdout_chunk.as_ref(),
+            JobEvent::StderrChunk(_) => meta.on_stderr_chunk.as_ref(),
             JobEvent::Exit(_) => meta.on_exit.as_ref(),
         }
     }
@@ -276,9 +321,15 @@ impl JobStore {
 
     pub fn clear(&mut self, lua: &Lua) {
         for (_, meta) in self.jobs.drain() {
-            for key in [meta.on_stdout, meta.on_stderr, meta.on_exit]
-                .into_iter()
-                .flatten()
+            for key in [
+                meta.on_stdout,
+                meta.on_stderr,
+                meta.on_stdout_chunk,
+                meta.on_stderr_chunk,
+                meta.on_exit,
+            ]
+            .into_iter()
+            .flatten()
             {
                 lua.remove_registry_value(key).ok();
             }
@@ -338,36 +389,47 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
     t.set(
         "jobstart",
         lua.create_function(|lua, (cmd, opts): (String, Option<Table>)| {
-            let (cwd, env, use_stdin, on_stdout, on_stderr, on_exit) = match opts {
-                Some(ref opts) => {
-                    let cwd: Option<String> = opts.get("cwd").ok();
-                    let env: Option<HashMap<String, String>> = opts
-                        .get::<Table>("env")
-                        .ok()
-                        .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
-                    let use_stdin: bool = opts.get("stdin").unwrap_or(false);
-                    let on_stdout = opts
-                        .get::<Function>("on_stdout")
-                        .ok()
-                        .map(|f| lua.create_registry_value(f))
-                        .transpose()?;
-                    let on_stderr = opts
-                        .get::<Function>("on_stderr")
-                        .ok()
-                        .map(|f| lua.create_registry_value(f))
-                        .transpose()?;
-                    let on_exit = opts
-                        .get::<Function>("on_exit")
-                        .ok()
-                        .map(|f| lua.create_registry_value(f))
-                        .transpose()?;
-                    (cwd, env, use_stdin, on_stdout, on_stderr, on_exit)
-                }
-                None => (None, None, false, None, None, None),
-            };
+            let (cwd, env, use_stdin, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit) =
+                match opts {
+                    Some(ref opts) => {
+                        let cwd: Option<String> = opts.get("cwd").ok();
+                        let env: Option<HashMap<String, String>> = opts
+                            .get::<Table>("env")
+                            .ok()
+                            .map(|t| t.pairs::<String, String>().filter_map(Result::ok).collect());
+                        let use_stdin: bool = opts.get("stdin").unwrap_or(false);
+                        let on_stdout = opts
+                            .get::<Function>("on_stdout")
+                            .ok()
+                            .map(|f| lua.create_registry_value(f))
+                            .transpose()?;
+                        let on_stderr = opts
+                            .get::<Function>("on_stderr")
+                            .ok()
+                            .map(|f| lua.create_registry_value(f))
+                            .transpose()?;
+                        let on_stdout_chunk = opts
+                            .get::<Function>("on_stdout_chunk")
+                            .ok()
+                            .map(|f| lua.create_registry_value(f))
+                            .transpose()?;
+                        let on_stderr_chunk = opts
+                            .get::<Function>("on_stderr_chunk")
+                            .ok()
+                            .map(|f| lua.create_registry_value(f))
+                            .transpose()?;
+                        let on_exit = opts
+                            .get::<Function>("on_exit")
+                            .ok()
+                            .map(|f| lua.create_registry_value(f))
+                            .transpose()?;
+                        (cwd, env, use_stdin, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit)
+                    }
+                    None => (None, None, false, None, None, None, None, None),
+                };
 
             with_task_jobs(lua, |store| {
-                store.start(&cmd, cwd, env, use_stdin, on_stdout, on_stderr, on_exit)
+                store.start(&cmd, cwd, env, use_stdin, on_stdout, on_stderr, on_stdout_chunk, on_stderr_chunk, on_exit)
             })
             .ok_or_else(|| mlua::Error::runtime("job store not initialized"))?
             .map_err(mlua::Error::runtime)
@@ -424,8 +486,8 @@ pub(crate) fn create_fn_table(lua: &Lua) -> LuaResult<Table> {
 
                 match event {
                     None => return Ok(mlua::Value::Nil),
-                    Some(JobEvent::Stdout(line)) => stdout_lines.push(line),
-                    Some(JobEvent::Stderr(line)) => stderr_lines.push(line),
+                    Some(JobEvent::Stdout(line)) | Some(JobEvent::StdoutChunk(line)) => stdout_lines.push(line),
+                    Some(JobEvent::Stderr(line)) | Some(JobEvent::StderrChunk(line)) => stderr_lines.push(line),
                     Some(JobEvent::Exit(code)) => {
                         break code;
                     }
@@ -453,7 +515,7 @@ mod tests {
 
     fn start_echo(store: &mut JobStore) -> u32 {
         store
-            .start("echo hello", None, None, false, None, None, None)
+            .start("echo hello", None, None, false, None, None, None, None, None)
             .unwrap()
     }
 
@@ -465,6 +527,8 @@ mod tests {
             Some("/nonexistent_dir_abc_xyz_123".into()),
             None,
             false,
+            None,
+            None,
             None,
             None,
             None,
@@ -629,7 +693,7 @@ mod tests {
     fn write_to_job_with_stdin_delivers_data() {
         let mut store = make_store();
         let id = store
-            .start("cat", None, None, true, None, None, None)
+            .start("cat", None, None, true, None, None, None, None, None)
             .unwrap();
 
         store.write(id, "hello stdin\n".into()).unwrap();
@@ -656,7 +720,7 @@ mod tests {
     fn write_after_kill_returns_error() {
         let mut store = make_store();
         let id = store
-            .start("sleep 10", None, None, true, None, None, None)
+            .start("sleep 10", None, None, true, None, None, None, None, None)
             .unwrap();
 
         store.write(id, "before".into()).unwrap();

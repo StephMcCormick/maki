@@ -157,9 +157,26 @@ type TaskMap = HashMap<ThreadKey, TaskCtx>;
 
 type ClickHandlerMap = HashMap<String, (RegistryKey, Arc<SharedBuf>)>;
 
+/// Tracks which task's job store should be used by FFI functions
+/// (e.g. `maki.fn.jobwrite`) when called from callbacks running in
+/// a different coroutine than the one that started the job.
+type ActiveTaskKey = Cell<Option<ThreadKey>>;
+
 type GlobalJobStore = JobStore;
 
 pub(crate) fn with_task_jobs<R>(lua: &Lua, f: impl FnOnce(&mut JobStore) -> R) -> Option<R> {
+    // Check active task key first (set by dispatch_async for callbacks
+    // running in a different coroutine than the one that started the job).
+    if let Some(active) = lua.app_data_ref::<ActiveTaskKey>() {
+        if let Some(key) = active.get() {
+            if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
+                if let Some(ctx) = tasks.get_mut(&key) {
+                    return Some(f(&mut ctx.jobs));
+                }
+            }
+        }
+    }
+    // Fall back to current coroutine's task.
     let key = ThreadKey::current(lua);
     if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
         if let Some(ctx) = tasks.get_mut(&key) {
@@ -221,6 +238,7 @@ pub(crate) fn enqueue_async_task(lua: &Lua, work_fn: RegistryKey) -> Result<(), 
 struct TaskCleanupGuard {
     lua: Lua,
     key: ThreadKey,
+    old_active: Option<ThreadKey>,
 }
 
 impl Drop for TaskCleanupGuard {
@@ -234,6 +252,10 @@ impl Drop for TaskCleanupGuard {
             task.jobs.clear(&self.lua);
             task.bufs.clear();
         }
+        // Restore the previous active task key.
+        if let Some(active) = self.lua.app_data_mut::<ActiveTaskKey>() {
+            active.set(self.old_active);
+        }
     }
 }
 
@@ -241,9 +263,18 @@ fn register_task(lua: &Lua, thread_key: ThreadKey, ctx: TaskCtx) -> TaskCleanupG
     if let Some(mut tasks) = lua.app_data_mut::<TaskMap>() {
         tasks.insert(thread_key, ctx);
     }
+    // Set active task key so FFI functions can find the right job store
+    // even when called from callbacks running in a different coroutine.
+    let old_active = lua
+        .app_data_ref::<ActiveTaskKey>()
+        .and_then(|a| a.get());
+    if let Some(active) = lua.app_data_mut::<ActiveTaskKey>() {
+        active.set(Some(thread_key));
+    }
     TaskCleanupGuard {
         lua: lua.clone(),
         key: thread_key,
+        old_active,
     }
 }
 
@@ -488,6 +519,7 @@ impl LuaRuntime {
         lua.set_app_data(SpawnQueue::default());
         lua.set_app_data(command_writer);
         lua.set_app_data(PromptExtraCallbacks::default());
+        lua.set_app_data(ActiveTaskKey::new(None));
 
         Ok(Self {
             lua,
@@ -862,9 +894,17 @@ impl LuaRuntime {
         tasks.insert(key, task_ctx);
         drop(tasks);
 
+        let old_active = self
+            .lua
+            .app_data_ref::<ActiveTaskKey>()
+            .and_then(|a| a.get());
+        if let Some(active) = self.lua.app_data_mut::<ActiveTaskKey>() {
+            active.set(Some(key));
+        }
         let _cleanup = TaskCleanupGuard {
             lua: self.lua.clone(),
             key,
+            old_active,
         };
 
         match func.call::<LuaValue>(input_lua) {
@@ -1125,14 +1165,30 @@ async fn dispatch_async(
 
             if let Some(func) = callback {
                 let arg: LuaValue = match &event {
-                    JobEvent::Stdout(line) | JobEvent::Stderr(line) => lua
+                    JobEvent::Stdout(line)
+                    | JobEvent::Stderr(line)
+                    | JobEvent::StdoutChunk(line)
+                    | JobEvent::StderrChunk(line) => lua
                         .create_string(line)
                         .map(LuaValue::String)
                         .unwrap_or(LuaValue::Nil),
                     JobEvent::Exit(code) => LuaValue::Integer(*code as i64),
                 };
-                if let Err(e) = func.call::<()>((job_id, arg)) {
+                // Ensure ActiveTaskKey points to this task so that
+                // maki.fn.jobwrite (and other FFI functions) find the right job store
+                // when called from the callback, which runs in a different coroutine.
+                let old_active = lua
+                    .app_data_ref::<ActiveTaskKey>()
+                    .and_then(|a| a.get());
+                if let Some(active) = lua.app_data_mut::<ActiveTaskKey>() {
+                    active.set(Some(key));
+                }
+                if let Err(e) = func.call_async::<()>((job_id, arg)).await {
                     return ToolCallReply::err(format!("job callback error: {e}"));
+                }
+                // Restore previous active task key.
+                if let Some(active) = lua.app_data_mut::<ActiveTaskKey>() {
+                    active.set(old_active);
                 }
             }
 
@@ -1570,6 +1626,7 @@ mod tests {
         drop(TaskCleanupGuard {
             lua: lua.clone(),
             key,
+            old_active: None,
         });
         let tasks = lua.app_data_ref::<TaskMap>().unwrap();
         assert!(!tasks.contains_key(&key));
