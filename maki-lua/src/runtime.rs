@@ -1501,6 +1501,10 @@ pub fn spawn(
                     }
                     }
                 }
+                // Kill all global jobs (e.g., rust-analyzer) on shutdown.
+                if let Some(mut store) = rt.lua.app_data_mut::<GlobalJobStore>() {
+                    store.kill_all();
+                }
             }));
         })
         .map_err(|e| PluginError::Io {
