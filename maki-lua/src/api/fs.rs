@@ -319,6 +319,26 @@ pub(crate) fn create_fs_table(lua: &Lua, perms: &PluginPermissions) -> LuaResult
     )?;
 
     t.set(
+        "realpath",
+        lua.create_function(|_, path: String| {
+            let abs = make_absolute(&path)?;
+            std::fs::canonicalize(&abs)
+                .map_err(|e| mlua::Error::runtime(format!("fs.realpath({path}): {e}")))
+                .and_then(|p| path_to_string(&p))
+        })?,
+    )?;
+
+    t.set(
+        "dirpath",
+        lua.create_function(|_, path: String| {
+            Ok(Path::new(&path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .map(|s| s.to_owned()))
+        })?,
+    )?;
+
+    t.set(
         "dir",
         perms.guard_async(
             FsRead,

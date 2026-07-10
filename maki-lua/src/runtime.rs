@@ -1388,8 +1388,11 @@ async fn dispatch_async(
                 .and_then(|k| lua.registry_value::<Function>(k).ok());
 
             if let Some(func) = callback {
-                let arg: LuaValue = match &event {
-                    JobEvent::Stdout(line) | JobEvent::Stderr(line) => lua
+let arg: LuaValue = match &event {
+                    JobEvent::Stdout(line)
+                    | JobEvent::Stderr(line)
+                    | JobEvent::StdoutChunk(line)
+                    | JobEvent::StderrChunk(line) => lua
                         .create_string(line)
                         .map(LuaValue::String)
                         .unwrap_or(LuaValue::Nil),

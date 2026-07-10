@@ -6,6 +6,13 @@ pub(crate) fn create_env_table(lua: &Lua, perms: &PluginPermissions) -> LuaResul
     let t = lua.create_table()?;
 
     t.set(
+        "getenv",
+        lua.create_function(|_, key: String| {
+            Ok(std::env::var(&key).ok())
+        })?,
+    )?;
+
+    t.set(
         "state_dir",
         perms.guard(Env, lua, |_, ()| {
             Ok(maki_storage::paths::state_dir()

@@ -470,6 +470,9 @@ pub fn index(path: &str, no_plugins: bool) -> Result<()> {
     host.load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
+    host.load_user_plugins()
+        .context("load user plugins")?;
+
     let abs_path = Path::new(path)
         .canonicalize()
         .unwrap_or_else(|_| Path::new(path).to_path_buf());

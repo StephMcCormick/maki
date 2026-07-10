@@ -73,7 +73,7 @@ pub(crate) fn create_json_table(lua: &Lua) -> LuaResult<Table> {
         "decode",
         lua.create_function(|lua, s: String| {
             match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(v) => Ok((json_to_lua(lua, &v)?, Value::Nil)),
+Ok(v) => Ok((json_to_lua(lua, &v)?, Value::Nil)),
                 Err(e) => err_pair(lua, e),
             }
         })?,

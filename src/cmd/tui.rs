@@ -109,6 +109,10 @@ pub fn run(cli: Cli) -> Result<()> {
         .load_builtins(&config.plugins)
         .context("load builtin plugins")?;
 
+    plugin_host
+        .load_user_plugins()
+        .context("load user plugins")?;
+
     let lua_command_reader = plugin_host.command_reader();
     let ui_action_rx = plugin_host.ui_action_rx();
 

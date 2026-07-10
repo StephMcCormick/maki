@@ -15,6 +15,8 @@ use test_case::test_case;
 #[test_case("view_image", include_str!("../../plugins/view_image/tests/spec.lua") ; "view_image_plugin_spec")]
 #[test_case("webfetch", include_str!("../../plugins/webfetch/tests/spec.lua") ; "webfetch_plugin_spec")]
 #[test_case("websearch", include_str!("../../plugins/websearch/tests/spec.lua") ; "websearch_plugin_spec")]
+#[test_case("rust_analyzer", include_str!("../../../maki-agent/plugins/rust-analyzer/tests/spec.lua") ; "rust_analyzer_spec")]
+#[test_case("rust_analyzer_integration", include_str!("../../../maki-agent/plugins/rust-analyzer/tests/integration_spec.lua") ; "rust_analyzer_integration_spec")]
 #[test_case("write", include_str!("../../plugins/write/tests/spec.lua") ; "write_plugin_spec")]
 fn plugin_spec(name: &str, spec: &str) {
     let reg = Arc::new(ToolRegistry::new());
